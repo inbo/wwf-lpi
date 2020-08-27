@@ -1,0 +1,225 @@
+---
+title: "Grid file comparison"
+author: "Hans Van Calster"
+date: "24 juli 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = FALSE)
+
+library(dplyr) # data wrangling
+library(sf) # simple features package for spatial data handling
+library(ggplot2) # to make nice graphs 
+library(tibble) # better data.frame format
+library(tidyr)
+library(readxl)
+library(DT)
+library(leaflet)
+options(stringsAsFactors = FALSE)
+```
+
+```{r}
+be1grid <- read_sf(file.path("../data", "Belgium.sqlite"), layer = "be_1km")
+```
+
+```{r warning=FALSE}
+utm1belgium <- read_sf(dsn = "S:/Belgie/Locatie/UTMroosters/utm1_bel.shp") %>%
+  st_transform(crs = 4326)
+
+utm1bel_to_referencegrid <- utm1belgium %>%
+  st_drop_geometry() %>%
+  bind_cols(utm1belgium %>%
+              #transform to ETRS89-LAEA to have planar coordinates
+              st_transform(crs = 3035) %>%
+              st_centroid() %>%
+              # determine EEA reference grid 1km x 1km square
+              st_join(be1grid,
+                      join = st_intersects,
+                      left = TRUE) %>%
+              st_drop_geometry() 
+              ) %>%
+  as_tibble() %>%
+  select(TAG, site_id = cellcode)
+```
+
+
+
+
+```{r}
+provinces <- read_sf(dsn = "S:/Belgie/Grenzen/Administratief/provinciebel.shp") %>%
+  st_transform(crs = 4326)
+```
+
+
+
+```{r warning = FALSE}
+site_id_provinces <- be1grid %>%
+  st_centroid() %>%
+  st_join(provinces %>%
+            st_transform(crs = 3035),
+          join = st_intersects, 
+          left = FALSE) %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  select(EEA_Gridcell = cellcode, gewest = GEWEST, province = Naam)
+```
+
+The file `site_id_provinces` was constructed as follows:
+
+- calculate centroids of Belgium 1km x 1 km EEA reference grid
+- calcualate a spatial inner join with the provinces of Belgium based on intersection of the provinces of Belgium polygons with the centroids of the Belgium 1km x 1 km EEA reference grid
+
+
+```{r}
+grid_final <- read_excel(path = "../data/grid_file_FINAL.xlsx") %>%
+  rename(x_coord = `x-coord`, y_coord = `y-coord`)
+```
+
+```{r eval = FALSE}
+inborutils::guess_projection(grid_final, col_long = "x_coord", col_lat = "y_coord")
+#espg:31370 (Lambert72)
+```
+
+
+Grid cells in grid_final that are not in `site_id_provinces`:
+
+```{r}
+bordercells <- grid_final %>%
+  anti_join(site_id_provinces) 
+
+bordercells %>% datatable()
+```
+
+
+
+All grid cells in site_id_provinces are also in grid_final:
+
+```{r}
+site_id_provinces %>%
+  anti_join(grid_final)
+```
+
+
+The file `grid_files_FINAL` contains cells along the border (that are not in `site_id_provinces`) that have most of their area outside Belgium (zoom in to the border to see this):
+
+```{r}
+# convert all to WGS84
+wgs_grid_final_centroids <- grid_final %>%
+  st_as_sf(coords = c("x_coord", "y_coord"),
+           crs = 31370) %>%
+  st_transform(crs = 4326)
+
+wgs_grid_final <- be1grid %>%
+  st_transform(crs = 4326) %>%
+  semi_join(grid_final,
+             by = c("cellcode" = "EEA_Gridcell"))
+
+wgs_site_id_provinces <- be1grid %>%
+  st_transform(crs = 4326) %>%
+  semi_join(site_id_provinces,
+             by = c("cellcode" = "EEA_Gridcell"))
+
+wgs_bordercells <- be1grid %>%
+  st_transform(crs = 4326) %>%
+  semi_join(bordercells,
+             by = c("cellcode" = "EEA_Gridcell"))
+
+```
+
+
+```{r}
+wgs_provinces <- provinces %>%
+  st_transform(crs = 4326)
+
+wgs_provinces %>%
+  leaflet() %>%
+  addTiles() %>%
+  addPolygons(weight = 3, opacity = 0.1, color = "red", fillColor = "red") %>%
+  addPolygons(data = wgs_bordercells, weight = 1, opacity = 0.2)
+```
+
+
+However, for the species observations we used a mapping from UTM1 Belgium to the EEA reference grid. The UTM1 Belgium file contained UTM1 grid cells that overlapped Belgium (blue squares = UTM1, black squares is mapping to EEA reference grid).
+
+
+```{r}
+
+
+wgs_mapping <- be1grid %>%
+  semi_join(utm1bel_to_referencegrid,
+            by = c("cellcode" = "site_id")) %>%
+  st_transform(crs = 4326)
+```
+
+
+The file `site_id_provinces.csv` was thus misleading and should not be used. 
+
+Some small differences remain (see below map, zoom in to see discrepancies), but we made sure that the final observation records only contained reference grid cells that are in `grid_files_FINAL`.
+
+
+```{r}
+not_in_mapping <- grid_final %>%
+  anti_join(utm1bel_to_referencegrid,
+            by = c("EEA_Gridcell" = "site_id"))
+```
+
+
+```{r}
+not_in_finalgrid <- utm1bel_to_referencegrid %>%
+  anti_join(grid_final,
+            by = c("site_id" = "EEA_Gridcell"))
+```
+
+
+Green squares, not filled: UTM1 Belgium grid
+
+Black squares, not filled: squares that we selected based on mapping from UTM1 centroid to EEA grid squares.
+
+Black and filled squares: not in our mapping from UTM1 to EEA grid because for any point within these squares, the translation from the point to the UTM1 centroid to the EEA grid always results in one of the surrounding EEA grid cells being selected.
+
+Blue and filled squares: not in final grid because outside Belgium. The translation can result in EEA grid cells being completely outside Belgium, in which case they were removed in the final grid. This is no longer an issue in the updated observation files because EEA grid cells that were not in `grid_file_FINAL` were removed. 
+
+```{r}
+wgs_not_in_mapping <- be1grid %>%
+  st_transform(crs = 4326) %>%
+  semi_join(not_in_mapping,
+             by = c("cellcode" = "EEA_Gridcell"))
+
+wgs_not_in_finalgrid <- be1grid %>%
+  st_transform(crs = 4326) %>%
+  semi_join(not_in_finalgrid,
+             by = c("cellcode" = "site_id"))
+
+wv <- wgs_provinces %>%
+  filter(Naam == "West-Vlaanderen")
+
+bbwv <- wv %>%
+  st_coordinates() %>%
+  as_tibble() %>%
+  summarise(xmin = min(X),
+            xmax = max(X),
+            ymin = min(Y),
+            ymax = max(Y),
+            ymean = mean(ymin, ymax),
+            xmean = mean(xmin, xmax))
+
+wgs_provinces %>%
+  leaflet() %>%
+  addTiles() %>%
+  addPolygons(weight = 2, opacity = 0.5, color = "red", fill = FALSE) %>%
+  addPolygons(data = wgs_not_in_mapping, weight = 2, opacity = 0.5, fill = TRUE, 
+              color = "black", fillColor = "black") %>%
+  addPolygons(data = wgs_not_in_finalgrid, weight = 2, opacity = 0.5, fill = TRUE,
+              color = "blue", fillColor = "blue")  %>%
+  addPolygons(data = utm1belgium, weight = 1, opacity = 0.2, fill = FALSE, color = "green") %>%
+  addPolygons(data = wgs_mapping, weight = 1, opacity = 0.3, fill = FALSE, color = "black") 
+```
+
+
+
+
+
+
+

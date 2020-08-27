@@ -1,0 +1,796 @@
+---
+title: "Data preparation steps for WWF LPR assessment of grasshoppers and crickets"
+author: "Hans Van Calster, Els Lommelen"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = FALSE)
+
+library(dplyr) # data wrangling
+library(sf) # simple features package for spatial data handling
+library(ggplot2) # to make nice graphs 
+library(inborutils) # rgbif function
+library(tibble) # better data.frame format
+library(lubridate) # date-time handling
+library(tidyr)
+library(purrr)
+library(readxl)
+source("functions.R")
+options(stringsAsFactors = FALSE)
+set.seed(1235456)
+```
+
+
+```{r eval = !file.exists(file.path("../data", "Belgium_spatialite.zip"))}
+if (!interactive()) {
+  # explicitly set mode = "wb", otherwise zip file will be corrupt
+  download.file("https://www.eea.europa.eu/data-and-maps/data/eea-reference-grids-2/gis-files/belgium-spatialite/at_download/file", destfile = file.path("../data", "Belgium_spatialite.zip"), mode = "wb")
+  
+  # this will extract a file Belgium.sqlite to the data folder
+  unzip(zipfile = file.path("../data", "Belgium_spatialite.zip"), exdir = "../data")  
+}
+```
+
+```{r}
+be1grid <- read_sf(file.path("../data", "Belgium.sqlite"), layer = "be_1km")
+```
+
+```{r warning=FALSE}
+utm1belgium <- read_sf(dsn = "S:/Belgie/Locatie/UTMroosters/utm1_bel.shp") %>%
+  st_transform(crs = 4326)
+
+utm1bel_to_referencegrid <- utm1belgium %>%
+  st_drop_geometry() %>%
+  bind_cols(utm1belgium %>%
+              #transform to ETRS89-LAEA to have planar coordinates
+              st_transform(crs = 3035) %>%
+              st_centroid() %>%
+              # determine EEA reference grid 1km x 1km square
+              st_join(be1grid,
+                      join = st_intersects,
+                      left = TRUE) %>%
+              st_drop_geometry() 
+              ) %>%
+  as_tibble() %>%
+  select(TAG, site_id = cellcode)
+```
+
+
+```{r}
+provinces <- read_sf(dsn = "S:/Belgie/Grenzen/Administratief/provinciebel.shp") %>%
+  st_transform(crs = 4326)
+```
+
+
+# Received datasets
+
+The following datasets were received:
+
+- Natuurpunt / Natagora: data from waarnemingen.be / observations.be; grasshoppers and crickets; Belgium
+- DEMNA: grasshoppers and crickets; Walloon region
+- Saltabel: grasshoppers and crickets; Belgium
+
+# Data cleaning on separate datasets
+
+## Natuurpunt / Natagora
+
+### Filtering
+
+
+- We remove duplicate rows (copied observations, i.e. two observers where the second copied from the first)
+- We exlude lifestages: EGG, EXUVIAE and all those relating to LARVAE
+- We removed the following variables: authority, soortid_waarnemingen, levensstadium, gedrag_methode, lifestage, behaviour_method
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+
+
+
+```{r}
+gh1 <- read.csv2(file = "../data/sprinkhanen en krekels WWF LPI waarnemingen incl precision.csv") %>%
+  as_tibble() %>%
+  distinct() %>%
+  select(-levensstadium, -gedrag_methode) %>%
+  filter(!(lifestage %in% c("EGG", "EXUVIAE")),
+         !grepl(pattern = "LARV", x = .$lifestage)) %>%
+  select(-lifestage, -behaviour_method, -authority, -soortid_waarnemingen) %>%
+  mutate(datum = ymd(datum),
+         julian_day = yday(datum)) %>%
+  group_by_at(.vars = vars(-aantal)) %>%
+  summarise(aantal = max(aantal)) %>%
+  ungroup()
+  
+```
+
+
+```{r eval=FALSE}
+gh1 %>%
+  summarise_all(.funs = function(x) sum(is.na(x))) %>%
+  gather(key = "variable", value = "number of NA values") %>%
+  kable()
+```
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+```{r gh1gbifnames}
+my_gbif_terms <- c("usageKey",
+                "scientificName", 
+                "canonicalName",
+                "rank",
+                "order",
+                "matchType",
+                "phylum", 
+                "kingdom",
+                "genus", 
+                "class",
+                "confidence",
+                "synonym",
+                "status",
+                "family",
+                "species",
+                "speciesKey")
+gh1_names_df <- gh1 %>%
+  distinct(naam_lat) %>%
+  gbif_species_name_match(name = "naam_lat", gbif_terms = my_gbif_terms)
+```
+
+All names could be parsed.
+
+```{r eval=FALSE}
+gh1_names_df %>%
+  filter(is.na(usageKey)) #OK
+```
+
+The following names are synonyms in the GBIF taxonomic backbone:
+
+```{r}
+gh1_names_df %>%
+  filter(synonym == TRUE) %>%
+  select(naam_lat, species, rank, synonym) %>%
+  kable()
+```
+
+The species_id is taken from the field speciesKey (which resolves synonyms).
+
+We keep only species that have matchType EXACT or FUZZY and which are of rank SPECIES.
+
+```{r}
+gh1_names_df <- gh1_names_df %>%
+  filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES") %>%
+  select(naam_lat, scientificName, canonicalName, rank, 
+         status, matchType, family, genus, species, species_id = speciesKey) 
+```
+
+```{r}
+gh1 <- gh1 %>%
+  inner_join(gh1_names_df %>%
+              select(naam_lat, species_id),
+            by = "naam_lat") %>%
+  select(-naam_lat)
+```
+
+
+
+### Harmonisation of spatial reference formats
+
+The dataset contains the following spatial information:
+
+- x_coordinate and y_coordinate: decimaldegree in WGS84 format
+- geographic_uncertainty: positional uncertainty in meters (the delivered data were already filtered to include only records where the geographic_uncertainty was less than 1000 meters)
+
+We proceed as follows:
+
+- determine the UTM1 square that intersects with the coordinates
+- map the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square
+- aggregate the data (multiple observations of the same species, ..., same square, on the same day will be aggregated to the maximum number of indivuals counted)
+
+The mapping of the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square was calculated in advance. To do this, we calculated the centroid of each UTM1 square in ETRS89-LAEA coordinates and determined the reference grid square that intersected with that centroid. 
+
+```{r}
+gh1 <- gh1 %>%
+  select(-geographic_uncertainty) %>%
+  st_as_sf(coords = c("x_coordinate", "y_coordinate"),
+           crs = 4326) %>%
+  st_transform(crs = 3035) %>%
+  st_join(utm1belgium %>%
+            st_transform(crs = 3035) %>%
+            select(-Shape_Leng, -Shape_Area),
+          join = st_intersects,
+          left = FALSE) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  select(-TAG)
+  
+```
+
+```{r}
+gh1 <- gh1 %>%
+  group_by_at(.vars = vars(-aantal)) %>%
+  summarise(aantal = max(aantal)) %>%
+  ungroup()
+```
+
+
+### Harmonisation of field names
+
+
+```{r}
+gh1 <- gh1 %>%
+  mutate(year = year(datum),
+         month = month(datum),
+         day = day(datum),
+         julian_day = yday(datum),
+         source = "waarnemingen.be/observations.be") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count = aantal,
+         source)
+```
+
+
+```{r}
+glimpse(gh1)
+```
+
+## Saltabel
+
+### Filtering
+
+GBIF data: https://www.gbif.org/dataset/76cc7230-76b6-4763-9caf-22626b29c0a6
+
+Downloaded the DwC-Archive direct from IPT: https://ipt.inbo.be/resource?r=saltabel-occurrences
+
+DOI: https://doi.org/10.15468/1rcpsq
+
+
+Citatie: 
+
+Adriaens T, Decleer K, Devriese H, Lock K, Lambrechts J, San Martin y Gomez G, Piesschaert F, Maes D, Brosens D, Desmet P (2013): Saltabel - Orthoptera in Belgium. v5.3. Research Institute for Nature and Forest (INBO). Dataset/Occurrence. https://doi.org/10.15468/1rcpsq
+
+This dataset contains centroids of UTM5 (5 km) and UTM1 (1 km) and a few more precise data. The data are in WGS84 CRS. The UTM1 and more precise observations can be filtered via the coordinateUncertaintyInMeters field. This field gives the radius of a circle containing the UTM square. 
+
+- We removed data at UTM5 resolution
+- We removed all data that are not at day resolution and data before 1990 (definitely not enough data for SOM).
+- Most records do not contain information on sex and / or lifestage, so excluding these variables.
+- We replaced NA values in individualCount by 1 (since the species is recorded, at least one individual is seen).
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+
+```{r warning=FALSE, message=FALSE}
+gh2 <- read.delim(file = "../data/dwca-saltabel-occurrences-v5.2/occurrence.txt") %>%
+  as_tibble() %>%
+  filter(coordinateUncertaintyInMeters <= 710) %>%
+  mutate_all(.funs = function(x) ifelse(x == "",
+                                        NA,
+                                        x)) %>%
+  select(datasetName, eventDate, individualCount, 
+         decimalLatitude, decimalLongitude, 
+         coordinateUncertaintyInMeters, scientificName) %>%
+  mutate(
+    eventDate = as_date(parse_date_time(eventDate, orders = "Y!md")),
+    julian_day = yday(eventDate),
+    individualCount = ifelse(is.na(individualCount), 1, individualCount)) %>%
+  filter(!is.na(eventDate),#remove the once that failed to parse YY-MM-DD format
+         year(eventDate) >= 1990) %>%
+  distinct() %>%
+  group_by_at(.vars = vars(-individualCount)) %>%
+  summarise(individualCount = max(individualCount)) %>%
+  ungroup() %>%
+  rename(naam_lat = scientificName)
+```
+
+
+
+```{r eval=FALSE}
+gh2 %>%
+  summarise_all(.funs = function(x) sum(is.na(x))) %>%
+  gather(key = "variable", value = "number of NA values") %>%
+  kable()
+```
+
+
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+We changed spelling of one *Gomphocerripus rufus* into *Gomphocerippus rufus* (because GBIF database contains incorrect spelling, the species would not parse using the correct spelling)
+
+```{r gh2gbifnames}
+#Change spelling of one species name (because GBIF database contains incorrect spelling, the species would not parse using the correct spelling)
+
+gh2[gh2$naam_lat == "Gomphocerripus rufus","naam_lat"] <- "Gomphocerippus rufus"
+
+gh2_names_df <- gh2 %>%
+  distinct(naam_lat) %>%
+  gbif_species_name_match(name = "naam_lat", gbif_terms = my_gbif_terms)
+```
+
+Al species names could be parsed.
+
+```{r eval=FALSE}
+gh2_names_df %>%
+  filter(is.na(usageKey)) #OK
+```
+
+The following names are synonyms in the GBIF taxonomic backbone:
+
+```{r}
+gh2_names_df %>%
+  filter(synonym == TRUE) %>%
+  select(naam_lat, species, rank, synonym) %>%
+  kable()
+```
+
+The species_id is taken from the field speciesKey (which resolves synonyms).
+
+We keep only species that have matchType EXACT or FUZZY and which are of rank SPECIES.
+
+```{r}
+gh2_names_df <- gh2_names_df %>%
+  filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES") %>%
+  select(naam_lat, scientificName, canonicalName, rank, 
+         status, matchType, family, genus, species, species_id = speciesKey)
+```
+
+```{r}
+gh2 <- gh2 %>%
+  inner_join(gh2_names_df %>%
+              select(naam_lat, species_id),
+            by = "naam_lat") %>%
+  select(-naam_lat)
+```
+
+
+
+### Harmonisation of spatial reference formats
+
+The dataset contains the following spatial information:
+
+- decimalLongitude and decimalLatitude: decimaldegree in WGS84 format
+- coordinateUncertaintyInMeters: positional uncertainty in meters 
+
+We proceed as follows:
+
+- determine the UTM1 square that intersects with the coordinates
+- map the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square
+- aggregate the data (multiple observations of the same species, ..., same square, on the same day will be aggregated to the maximum number of indivuals counted)
+
+The mapping of the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square was calculated in advance. To do this, we calculated the centroid of each UTM1 square in ETRS89-LAEA coordinates and determined the reference grid square that intersected with that centroid. 
+
+```{r}
+gh2 <- gh2 %>%
+  select(-coordinateUncertaintyInMeters) %>%
+  st_as_sf(coords = c("decimalLongitude", "decimalLatitude"),
+           crs = 4326) %>%
+  st_transform(crs = 3035) %>%
+  st_join(utm1belgium %>%
+            st_transform(crs = 3035) %>%
+            select(-Shape_Leng, -Shape_Area),
+          join = st_intersects,
+          left = FALSE) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  select(-TAG)
+```
+
+```{r}
+gh2 <- gh2 %>%
+  group_by_at(.vars = vars(-individualCount)) %>%
+  summarise(individualCount = max(individualCount)) %>%
+  ungroup()
+```
+
+
+### Harmonisation of field names
+
+```{r}
+gh2 <- gh2 %>%
+  mutate(year = year(eventDate),
+         month = month(eventDate),
+         day = day(eventDate),
+         julian_day = yday(eventDate),
+         source = "Saltabel") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count = individualCount,
+         source)
+```
+
+
+```{r}
+glimpse(gh2)
+```
+
+
+## DEMNA
+
+### Filtering
+
+```{r}
+gh3 <- read_excel("../data/Orthoptera/orthoptera.xlsx")
+gh3_units <- read_excel("../data/Orthoptera/orthopetera_units.xlsx")
+gh3_liste_champs <- read_excel("../data/Orthoptera/orthoptera_Liste_champs.xlsx")
+```
+
+
+- We removed observations without precise date (month or year resolution):
+- We removed "duplicate" rows. In the original database, these are not duplicates, but: 
+    1. Observations of different individuals of different sexes the same date in the same location
+    2. Observations of different individuals of the same species at the same date in the same UTM square but at different locations
+- We removed observations before 1980 (definitely too few) and those from 2019 (incomplete year).
+- We drop the det field (which contains an identifier for observer) and validation field (we do not filter based on the validation field because common species are never formely validated in the database - pers.comm. Yvan Barbier)
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+
+
+```{r warning=FALSE}
+gh3 <- gh3 %>%
+  select(topo, taxprio, full_date, n, unit, det, validation) %>%
+  left_join(gh3_units %>%
+              select(unit, signification_en),
+            by = "unit") %>%
+  select(-unit) %>%
+  rename(unit = signification_en)  %>%
+  mutate(datum = ymd(full_date)) %>%
+  filter(!is.na(datum) #remove the once that failed to parse
+         ) %>% 
+  select(-full_date, -unit, -det, -validation) %>%
+  distinct() %>%
+  group_by_at(.vars = vars(-n)) %>%
+  summarise(count = max(n)) %>%
+  ungroup()  %>%
+  filter(year(datum) != 2019,
+         year(datum) >= 1980)
+```
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+```{r gh3gbifnames}
+gh3_names_df <- gh3 %>%
+  distinct(taxprio) %>%
+  gbif_species_name_match(name = "taxprio", gbif_terms = my_gbif_terms)
+```
+
+Several species do not have an exact matchtype:
+
+```{r}
+gh3_names_df %>%
+  filter(matchType != "EXACT") %>%
+  select(taxprio, rank, matchType) %>%
+  kable(format = "latex",
+        longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = "repeat_header")
+```
+
+
+Keeping those that are of rank species and matchType exact or fuzzy:
+
+```{r}
+gh3_names_df <- gh3_names_df %>% 
+              filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES")
+
+gh3 <- gh3 %>%
+  semi_join(gh3_names_df,
+            by = "taxprio")
+```
+
+
+Some of the remaining species are synonyms.
+
+```{r}
+gh3_names_df %>% 
+  filter(synonym == TRUE) %>%
+  select(taxprio, species, synonym) %>%
+  kable()
+```
+
+The species_id is taken from speciesKey (which resolves synonyms).
+
+```{r}
+gh3_names_df <- gh3_names_df %>%
+  select(taxprio, scientificName, canonicalName, rank, 
+         status, matchType, family, genus, species, species_id = speciesKey)
+```
+
+```{r}
+gh3 <- gh3 %>%
+  left_join(gh3_names_df %>%
+              select(taxprio, species_id),
+            by = "taxprio") %>%
+  select(-taxprio)
+```
+
+
+### Harmonisation of spatial reference formats
+
+The DEMNA data contains UTM1 tags. We only need to map the UTM1 tags to the reference grid.
+
+```{r}
+gh3 <- gh3 %>%
+  mutate(TAG = stringr::str_sub(topo, start = 4, end = -1)) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  select(-topo, -TAG) 
+```
+
+
+### Harmonisation of field names
+
+```{r}
+gh3 <- gh3 %>%
+  mutate(year = year(datum),
+         month = month(datum),
+         day = day(datum),
+         julian_day = yday(datum),
+         source = "DEMNA") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count,
+         source)
+```
+
+
+```{r}
+glimpse(gh3)
+```
+
+
+
+
+# Combined datasets
+
+
+```{r}
+gh123 <- bind_rows(gh1, gh2, gh3)
+rm(gh1, gh2, gh3)
+```
+
+```{r}
+gh123_species_names <- bind_rows(gh1_names_df, gh2_names_df, gh3_names_df) %>%
+  select(-naam_lat, -taxprio) %>%
+  distinct()
+rm(gh1_names_df, gh2_names_df, gh3_names_df)
+```
+
+
+We exclude species that are much too rare for a SOM analysis (less than 200 records in total: this is very liberal; during the actual SOM analysis phase, much more species will likely be removed). A record is here a unique combination of km-square, year, month, day and datasource.
+
+
+```{r}
+gh123 %>%  
+  count(species_id) %>%
+  filter(n < 200) %>%
+  left_join(gh123_species_names %>%
+              distinct(species_id, species)) %>%
+  arrange(-n) %>%
+  kable(format = "latex",
+        longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = "repeat_header")
+```
+
+
+
+```{r}
+gh123 <- gh123 %>%
+  anti_join(gh123 %>%
+              count(species_id) %>%
+              filter(n < 200),
+            by = "species_id") 
+
+```
+
+
+```{r}
+gh123 <- gh123 %>%
+   group_by_at(.vars = vars(-count)) %>%
+  summarise(count = max(count)) %>%
+  ungroup()
+```
+
+
+```{r}
+gh123_species_names <- gh123_species_names %>%
+  distinct(species_id, species) %>%
+  semi_join(gh123 %>% distinct(species_id),
+            by = "species_id") 
+```
+
+
+
+
+## Determination of closure periods
+
+
+Separation between two flight periods is defined as a concavity in the density curve provided the distance from the concavity is at least 1/3 the maximum density value to the local peak left from the concavity and 1/5th to the local peak right from the concavity. In case of one generation, season_start is 5% percentile and season_end is 95% percentile. In case of more than one generation, the corresponding percentiles of the first generation are used. 
+
+<!--
+Onderstaande is ecologisch niet correct. Er zijn wel twee pieken in de records, maar het gaat niet om twee verschillende generaties.
+-->
+
+We found evidence of two generations in three *Tetrix* species (*T. ceperoi*, *T. subulata*, *T. undulata*).
+
+
+<!--
+DE CODE HIERONDER STAAT HET DEEL OM DE DATA TE FILTEREN VOLGENS CLOSURE PERIOD
+UITGECOMMENTARIEERD; AAN ARCO WERD DUS DE VOLLEDIGE DATA BEZORGD OMDAT hij gegevens nodig heeft over de gehele periode – ook buiten closure perioden – om nullen te genereren voor andere soorten.
+-->
+
+```{r}
+gh123_closureperiods <- gh123 %>%
+  group_by(species_id) %>%
+  nest() %>% 
+  mutate(seasondata = map(.x = data, .f = ~closure_periods(df = .x)),
+         plot = pmap(.l = list(data = data,
+                               seasondata = seasondata),
+                     .f = function(data, seasondata) {
+                       ggplot(data = data) +
+                         geom_density(aes(x = julian_day)) +
+                         geom_vline(data = seasondata %>%
+                                      gather(key = "key", value = "julian_day"),
+                                    aes(xintercept = julian_day, 
+                                        linetype = key == "valley")) +
+                         theme_bw() + 
+                         theme(legend.position = "none")
+                     })) %>%
+  unnest(seasondata) %>%
+  # mutate(data_filtered = pmap(.l = list(season_start = season_start,
+  #                                       season_end = season_end,
+  #                                       data = data),
+  #                             .f = function(data, season_start, season_end){
+  #                               data %>%
+  #                                 filter(between(julian_day, 
+  #                                                left = season_start, 
+  #                                                right = season_end))
+  #                             })) %>%
+  select(-data)
+```
+
+
+
+
+```{r eval = FALSE}
+plots <- gh123_closureperiods %>%
+  inner_join(gh123_species_names %>%
+               select(species_id, species)) %>%
+  mutate(filename = paste0(species, ".png")) %>% 
+  select(filename, plot)
+
+pwalk(plots, ggsave, path = "../output/")
+```
+
+
+## Total number of sightings by year and by site_id
+
+```{r}
+gh123 %>%
+  count(year) %>%
+  ggplot() +
+  geom_line(aes(x = year, y = n)) +
+  scale_y_log10("Total number of sightings (log-scale!)")
+```
+
+
+```{r sfplot_grasshoppers}
+be1grid %>%
+  rename(geometry = GEOMETRY) %>%
+  inner_join(gh123 %>%
+              count(site_id),
+             by = c("cellcode" = "site_id")) %>%
+  ggplot() +
+  geom_sf(aes(fill = log(n)), lwd = 0) +
+  scale_fill_gradient(low = "azure", high = "azure4")
+```
+
+
+
+## Final tables
+
+Extra filter to keep only grid cells in grid_file_FINAL.
+
+```{r}
+grid_final <- read_excel(path = "../data/grid_file_FINAL.xlsx") %>%
+  rename(x_coord = `x-coord`, y_coord = `y-coord`)
+```
+
+
+```{r eval=!file.exists(file.path("../output","grasshoppers_crickets_observations_finalgrid.csv"))}
+gh123 %>%
+  rename(EEA_Gridcell = site_id) %>%
+  inner_join(grid_final %>%
+               select(site_id = Site_id, EEA_Gridcell),
+             by = "EEA_Gridcell") %>%
+  arrange(species_id, year, month, day) %>%
+  select(species_id, year, month, day, julian_day, site_id, source, count) %>%
+  readr::write_csv(path = file.path("../output", 
+                                  "grasshoppers_crickets_observations_finalgrid.csv"))
+
+```
+
+
+```{r warning=FALSE}
+safe_lookup_vernacular_names <- possibly(lookup_vernacular_names, 
+                                         otherwise = data.frame(species_name_NL = NA,
+                                                                species_name_FR = NA))
+gh123_species_names <- gh123_species_names %>%
+  group_by(species_id, species) %>%
+  nest() %>%
+  mutate(vernacular = map(species_id, safe_lookup_vernacular_names)) %>%
+  unnest(vernacular) %>%
+  select(-data) %>%
+  rename(scientific_name = species) %>%
+  left_join(gh123_closureperiods %>% 
+              select(species_id, season_start, season_end),
+            by = "species_id")
+```
+
+
+```{r eval=!file.exists(file.path("../output", "grasshoppers_species.csv"))}
+readr::write_csv(x = gh123_species_names %>%
+                   arrange(scientific_name),
+                 path = file.path("../output", "grasshoppers_species.csv"))
+```
+
+
+
+
+The following tables were written to csv files (comma separated, and . as decimal mark):
+
+`grasshoppers_observations_finalgrid.csv`, first ten rows:
+
+```{r}
+gh123 %>%
+  rename(EEA_Gridcell = site_id) %>%
+  inner_join(grid_final %>%
+               select(site_id = Site_id, EEA_Gridcell),
+             by = "EEA_Gridcell") %>%
+  arrange(species_id, year, month, day) %>%
+  select(species_id, year, month, day, julian_day, site_id, source, count) 
+```
+
+`grasshoppers_species.csv`, first ten rows:
+
+```{r}
+gh123_species_names %>%
+  arrange(scientific_name)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,1031 @@
+---
+title: "Data preparation steps for WWF LPR assessment of Butterflies and moths"
+author: "Hans Van Calster, Els Lommelen"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+<!--
+Note: Arco van Strien detected that for three species there were still synonyms in the data that could not be detected by the automatic procedure followed in this script. They were joined together by Arco after we had delivered the data. 
+
+
+1946874 1946844 Ochlodes venata
+4535447 6221746 grote parelmoervlinder
+5881450 4535827 dagpauwoog
+
+Only the second number was used as species id; the records that had the first number were converted to the second number.
+
+In the first case, the both Ochlodes names in the dataset were valid, accepted species names according to the GBIF taxonomic backbone. However, one of the species does not occur here but has been wrongly attributed to Ochlodes venata in the past. 
+
+Workshop comments:
+- bosrandparelmoer: *naming problem*: *Argynnis adippe* and *Fabriciana adippe* combine them; 
+- boswitje: use *Leptidia spec.* as name
+- bruine vuurvlinder: OK, **why no trend in Flanders??** **second peak better?**
+- bruin dikkopje: OK; **trend for Flanders is missing?**
+- Diacrisia sannio: roodbandbeer: **why no trend for Flanders?**
+- Euclidia glyphica, bruine daguil: **why no analysis**
+- *check which species are removed because of less than 200 sightings*
+-->
+
+```{r setup, include=FALSE}
+library(knitr)
+opts_chunk$set(echo = FALSE)
+
+library(dplyr) # data wrangling
+library(sf) # simple features package for spatial data handling
+library(ggplot2) # to make nice graphs 
+library(inborutils) # rgbif function
+library(tibble) # better data.frame format
+library(lubridate) # date-time handling
+library(tidyr)
+library(purrr)
+library(readxl)
+source("functions.R")
+options(stringsAsFactors = FALSE)
+set.seed(1235456)
+```
+
+
+```{r eval = !file.exists(file.path("../data", "Belgium_spatialite.zip"))}
+if (!interactive()) {
+  # explicitly set mode = "wb", otherwise zip file will be corrupt
+  download.file("https://www.eea.europa.eu/data-and-maps/data/eea-reference-grids-2/gis-files/belgium-spatialite/at_download/file", destfile = file.path("../data", "Belgium_spatialite.zip"), mode = "wb")
+  
+  # this will extract a file Belgium.sqlite to the data folder
+  unzip(zipfile = file.path("../data", "Belgium_spatialite.zip"), exdir = "../data")
+}
+```
+
+```{r}
+be1grid <- read_sf(file.path("../data", "Belgium.sqlite"), layer = "be_1km")
+```
+
+```{r warning=FALSE}
+utm1belgium <- read_sf(dsn = "S:/Belgie/Locatie/UTMroosters/utm1_bel.shp") %>%
+  st_transform(crs = 4326)
+
+utm1bel_to_referencegrid <- utm1belgium %>%
+  st_drop_geometry() %>%
+  bind_cols(utm1belgium %>%
+              #transform to ETRS89-LAEA to have planar coordinates
+              st_transform(crs = 3035) %>%
+              st_centroid() %>%
+              # determine EEA reference grid 1km x 1km square
+              st_join(be1grid,
+                      join = st_intersects,
+                      left = TRUE) %>%
+              st_drop_geometry() 
+              ) %>%
+  as_tibble() %>%
+  select(TAG, site_id = cellcode)
+```
+
+
+```{r}
+provinces <- read_sf(dsn = "S:/Belgie/Grenzen/Administratief/provinciebel.shp") %>%
+  st_transform(crs = 4326)
+```
+
+
+# Received datasets
+
+The following datasets were received:
+
+- Natuurpunt / Natagora: data from waarnemingen.be / observations.be; butterflies and moths; Belgium
+- DEMNA: butterflies and moths; Walloon region
+- INBO: vlinderdatabank; only butterflies; Flanders
+
+# Data cleaning on separate datasets
+
+## Natuurpunt / Natagora
+
+### Filtering
+
+
+```{r}
+sqlite_file <- "../data/butterflies_moths.sqlite"
+table_name <- "b1"
+```
+
+```{r}
+con <- DBI::dbConnect(RSQLite::SQLite(), sqlite_file)
+b1 <- tbl(src = con, "b1")
+```
+
+- We removed duplicate rows (copied observations, i.e. two observers where the second copied from the first)
+- We kept only the following lifestages: UNKNOWN, IMAGO (and assume that most UNKNOWN are IMAGO)
+- We removed the following variables: authority, soortid_waarnemingen, levensstadium, gedrag_methode, lifestage, behaviour_method
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+
+
+
+```{r}
+b1 <- distinct(b1) %>%
+  filter(lifestage %in% c("UNKNOWN", "IMAGO")) %>%
+  select(-lifestage, -behaviour_method,
+         -authority, -soortid_waarnemingen, -levensstadium, -gedrag_methode) %>%
+  group_by_at(.vars = vars(-aantal)) %>%
+  summarise(aantal = max(aantal)) %>%
+  ungroup() %>%
+  collect()
+
+```
+
+
+```{r}
+DBI::dbDisconnect(con)
+rm(con)
+```
+
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+```{r b1gbifnames, cache=FALSE}
+my_gbif_terms <- c("usageKey",
+                "scientificName", 
+                "canonicalName",
+                "rank",
+                "order",
+                "matchType",
+                "phylum", 
+                "kingdom",
+                "genus", 
+                "class",
+                "confidence",
+                "synonym",
+                "status",
+                "family",
+                "species",
+                "speciesKey")
+b1_names_df <- b1 %>%
+  distinct(naam_lat) %>%
+  gbif_species_name_match(name = "naam_lat", gbif_terms = my_gbif_terms)
+```
+
+All names could be parsed.
+
+```{r eval=FALSE}
+b1_names_df %>%
+  filter(is.na(usageKey)) #OK
+```
+
+The following names are synonyms in the GBIF taxonomic backbone:
+
+```{r}
+b1_names_df %>%
+  filter(synonym == TRUE) %>%
+  select(naam_lat, species, rank, synonym) %>%
+  kable()
+```
+
+The species_id is taken from the field speciesKey (which resolves synonyms).
+
+We keep only species that have matchType EXACT or FUZZY and which are of rank SPECIES.
+
+```{r}
+b1_names_df <- b1_names_df %>%
+  filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES") %>%
+  select(naam_lat, scientificName, canonicalName, rank, 
+         status, matchType, order, family, genus, species, species_id = speciesKey) 
+```
+
+```{r}
+b1 <- b1 %>%
+  inner_join(b1_names_df %>%
+              select(naam_lat, species_id),
+            by = "naam_lat") %>%
+  select(-naam_lat)
+```
+
+### Harmonisation of spatial reference formats
+
+The dataset contains the following spatial information:
+
+- x_coordinate and y_coordinate: decimaldegree in WGS84 format
+- geographic_uncertainty: positional uncertainty in meters (the delivered data were already filtered to include only records where the geographic_uncertainty was less than 1000 meters)
+
+We proceed as follows:
+
+- determine the UTM1 square that intersects with the coordinates
+- map the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square
+- aggregate the data (multiple observations of the same species, ..., same square, on the same day will be aggregated to the maximum number of indivuals counted)
+
+The mapping of the UTM1 square to the corresponding EEA 1 km x 1 km reference grid square was calculated in advance. To do this, we calculated the centroid of each UTM1 square in ETRS89-LAEA coordinates and determined the reference grid square that intersected with that centroid. 
+
+```{r}
+b1 <- b1 %>%
+  select(-geographic_uncertainty) %>%
+  st_as_sf(coords = c("x_coordinate", "y_coordinate"),
+           crs = 4326) %>%
+  st_transform(crs = 3035) %>%
+  st_join(utm1belgium %>%
+            st_transform(crs = 3035) %>%
+            select(-Shape_Leng, -Shape_Area),
+          join = st_intersects,
+          left = FALSE) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  select(-TAG)
+  
+```
+
+```{r}
+b1 <- b1 %>%
+  group_by_at(.vars = vars(-aantal)) %>%
+  summarise(aantal = max(aantal)) %>%
+  ungroup()
+```
+
+
+
+### Harmonisation of field names
+
+species_id year month day site_id count (stage_id)
+
+```{r}
+b1 <- b1 %>%
+  mutate(year = year(datum),
+         month = month(datum),
+         day = day(datum),
+         julian_day = yday(datum),
+         source = "waarnemingen.be/observations.be") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count = aantal,
+         source)
+```
+
+
+```{r}
+glimpse(b1)
+```
+
+
+## DEMNA butterfly and moths data
+
+### Filtering
+
+
+```{r}
+b2a <- readr::read_delim("../data/heterocera/heterocera.txt", delim = "\t", guess_max = 3e4)
+b2a_units <- read_excel("../data/heterocera/heterocera_units.xlsx")
+#b2a_liste_champs <- read_excel("../data/heterocera/heterocera_Liste_champs.xlsx")
+```
+
+```{r}
+b2b <- readr::read_delim("../data/rhopalocera/rhopalocera.txt", delim = "\t", guess_max = 3e4)
+b2b_units <- read_excel("../data/rhopalocera/rhopalocera_units.xlsx")
+#b2b_liste_champs <- read_excel("../data/rhopalocera/rhopalocera_Liste_champs.xlsx")
+```
+
+```{r}
+b2_units <- b2a_units %>%
+  bind_rows(b2b_units) %>%
+  select(unit, signification_en) %>%
+  distinct()
+rm(b2a_units, b2b_units)
+```
+
+
+```{r}
+b2 <- b2a %>%
+  bind_rows(b2b)
+rm(b2a, b2b)
+```
+
+
+- removed observations without precise date (month or year resolution):
+- Removed "duplicate" rows. In the original database, these are not duplicates, but: 
+    1. Observations of different individuals of different sexes the same date in the same location
+    2. Observations of different individuals of the same species at the same date in the same UTM square but at different locations
+- Removed observations before 1980 (definitely too few) and those from 2019 (incomplete year).
+- We drop the det field (which contains an identifier for observer) and validation field (we do not filter based on the validation field because common species are never formely validated in the database - pers.comm. Yvan Barbier)
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+- We keep only the records that have as unit: "Couple", "Eggs laying", "Presence", "Specimens", 
+"Territory", "unknown" (assuming that all these units correspond with IMAGO lifestage)
+Check dates (format YYYY-MM-DD):
+
+```{r warning=FALSE}
+b2 <- b2 %>%
+  select(topo, taxprio, full_date, n, unit, det, validation) %>%
+  left_join(b2_units %>%
+              select(unit, signification_en),
+            by = "unit") %>%
+  select(-unit) %>%
+  rename(unit = signification_en)  %>%
+  mutate(datum = ymd(full_date)) %>%
+  filter(!is.na(datum),
+         unit %in% c("Couple", "Eggs laying", "Presence", "Specimens", 
+                     "Territory", "unknown")) %>% #remove the once that failed to parse
+  select(-full_date, -unit, -det, -validation) %>%
+  distinct() %>%
+  group_by_at(.vars = vars(-n)) %>%
+  summarise(count = max(n)) %>%
+  ungroup()  %>%
+  mutate(datum = ymd(datum)) %>%
+  filter(year(datum) != 2019,
+         year(datum) >= 1980)
+
+```
+
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+```{r b2gbifnames, cache=FALSE}
+b2_names_df <- b2 %>%
+  distinct(taxprio) %>%
+  gbif_species_name_match(name = "taxprio", gbif_terms = my_gbif_terms)
+```
+
+Several species do not have an exact matchtype:
+
+```{r}
+b2_names_df %>%
+  filter(matchType != "EXACT") %>%
+  select(taxprio, rank, matchType) %>%
+  kable(format = "latex",
+        longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = "repeat_header")
+```
+
+
+Keeping those that are of rank species and matchType exact or fuzzy:
+
+```{r}
+b2_names_df <- b2_names_df %>% 
+              filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES")
+
+b2 <- b2 %>%
+  semi_join(b2_names_df,
+            by = "taxprio")
+```
+
+
+Some of the remaining species are synonyms.
+
+```{r}
+b2_names_df %>% 
+  filter(synonym == TRUE) %>%
+  select(taxprio, species, synonym) %>%
+  kable()
+```
+
+The species_id is taken from speciesKey (which resolves synonyms).
+
+```{r}
+b2_names_df <- b2_names_df %>%
+  select(taxprio, scientificName, canonicalName, rank, 
+         status, matchType, order, family, genus, species, species_id = speciesKey) 
+```
+
+```{r}
+b2 <- b2 %>%
+  left_join(b2_names_df %>%
+              select(taxprio, species_id),
+            by = "taxprio") %>%
+  select(-taxprio)
+```
+
+
+
+### Harmonisation of spatial reference formats
+
+The DEMNA data contains UTM1 tags. We only need to map the UTM1 tags to the reference grid.
+
+```{r}
+b2 <- b2 %>%
+  mutate(TAG = stringr::str_sub(topo, start = 4, end = -1)) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  select(-topo, -TAG) 
+```
+
+
+### Harmonisation of field names
+
+```{r}
+b2 <- b2 %>%
+  mutate(year = year(datum),
+         month = month(datum),
+         day = day(datum),
+         julian_day = yday(datum),
+         source = "DEMNA") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count,
+         source)
+```
+
+
+```{r}
+glimpse(b2)
+```
+
+
+## INBO butterfly data
+
+### Filtering
+
+
+```{r}
+csv_name <- "../data/inbo_vlinderdatabank.csv"
+
+b3 <- read.csv2(file = csv_name, na.strings = "NULL", dec = ".")
+
+b3 <- b3 %>% as_tibble() %>%
+  select(-Soortcode) %>%
+  mutate(Begindatum = ymd(as_date(Begindatum)),
+         Einddatum = ymd(as_date(Einddatum)))
+```
+
+- We removed records at UTM5 resolution
+- We kept only records that have lifestage corresponding with IMAGO (i.e. "adult", "adult mannetje" and "adult wijfje")
+- We removed records that have neither Lambert coordinates nor UTM1 tag
+- We removed records not at day resolution
+- We removed variable "Waarnemer"
+- In case every variable has the same values except a different number of individuals counted, we keep only the maximum number of individuals observed per day.
+- We removed observations older than 1980
+
+```{r}
+b3 <- b3 %>%
+  filter(!(is.na(LamX) & is.na(UTM1)),
+         Levensstadium %in% c("Adult", "Adult Mannetje", "Adult Wijfje")) %>%
+  select(-UTM5) %>%
+  #Set some bad values in LamX and LamY fields to NA
+  mutate(LamX = ifelse(LamX < 1000, NA, LamX),
+         LamY = ifelse(LamY < 1000, NA, LamY)) %>%
+  filter(!(is.na(LamX) & is.na(UTM1))) %>%
+  mutate(Einddatum = as_date(ifelse(is.na(Einddatum), Begindatum, Einddatum))) %>%
+  filter(Begindatum == Einddatum) %>%
+  select(-Einddatum, -Levensstadium, -Waarnemer) %>%
+  rename(datum = Begindatum) %>%
+  group_by_at(.vars = vars(-Aantal)) %>%
+  summarise(count = max(Aantal)) %>%
+  ungroup() %>%
+  filter(year(datum) >= 1980)
+```
+
+
+
+### Harmonisation of species names
+
+All species names are parsed via GBIF and checked against the GBIF taxonomic backbone. Synonyms are replaced by the accepted species name. Note that the Catalogue of Life has 96% overlap with the GBIF taxonomic backbone.
+
+```{r b3gbifnames, cache=FALSE}
+b3_names_df <- b3 %>%
+  distinct(Wetenschappelijke.naam) %>%
+  gbif_species_name_match(name = "Wetenschappelijke.naam", gbif_terms = my_gbif_terms)
+```
+
+All names could be parsed.
+
+```{r eval=FALSE}
+b3_names_df %>%
+  filter(is.na(usageKey)) #OK
+```
+
+The following names are synonyms in the GBIF taxonomic backbone:
+
+```{r}
+b3_names_df %>%
+  filter(synonym == TRUE) %>%
+  select(Wetenschappelijke.naam, species, rank, synonym) %>%
+  kable()
+```
+
+The species_id is taken from the field speciesKey (which resolves synonyms).
+
+
+We keep only species that are of matchType EXACT or FUZZY and have rank SPECIES.
+
+```{r}
+b3_names_df <- b3_names_df %>%
+  filter(matchType %in% c("EXACT", "FUZZY"),
+                     rank == "SPECIES") %>%
+  select(Wetenschappelijke.naam, scientificName, canonicalName, rank, 
+         status, matchType, order, family, genus, species, species_id = speciesKey) 
+```
+
+```{r}
+b3 <- b3 %>%
+  inner_join(b3_names_df %>%
+              select(Wetenschappelijke.naam, species_id),
+            by = "Wetenschappelijke.naam") %>%
+  select(-Wetenschappelijke.naam)
+```
+
+### Harmonisation of spatial reference formats
+
+
+If the records have LamX/LamY:
+
+- assign UTM1 tag
+- map UTM1 tag to EEA reference grid
+
+If the records only have UTM1 tag:
+
+- map to EEA reference grid
+
+```{r message=FALSE}
+b3_xy <- b3 %>%
+  filter(!is.na(LamX))
+
+b3_utm1only <- b3 %>%
+  anti_join(b3_xy)
+```
+
+
+```{r}
+b3_xy <- b3_xy %>%
+  st_as_sf(coords = c("LamX", "LamY"),
+           crs = 31370) %>%
+  st_transform(crs = 3035) %>%
+  st_join(utm1belgium %>%
+            st_transform(crs = 3035) %>%
+            select(-Shape_Leng, -Shape_Area),
+          join = st_intersects,
+          left = FALSE) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = "TAG") %>%
+  st_drop_geometry() %>%
+  as_tibble() %>%
+  select(-TAG, -UTM1)
+```
+
+```{r}
+b3_utm1only <- b3_utm1only %>%
+  select(-LamX, -LamY) %>%
+  inner_join(utm1bel_to_referencegrid,
+            by = c("UTM1" = "TAG")) %>%
+  select(-UTM1)
+```
+
+
+```{r}
+# combine
+b3 <- bind_rows(b3_xy, b3_utm1only)
+rm(b3_xy, b3_utm1only)
+```
+
+
+### Harmonisation of field names
+
+
+```{r}
+b3 <- b3 %>%
+  mutate(year = year(datum),
+         month = month(datum),
+         day = day(datum),
+         julian_day = yday(datum),
+         source = "INBO") %>%
+  select(species_id,
+         year,
+         month,
+         day,
+         julian_day,
+         site_id,
+         count,
+         source)
+```
+
+
+```{r}
+glimpse(b3)
+```
+
+
+
+# Combined datasets
+
+```{r}
+b123 <- bind_rows(b1, b2, b3)
+rm(b1, b2, b3)
+```
+
+
+```{r}
+rhopalocera <- data.frame(clade = "Rhopalocera",
+                          family = c("Hedylidae", 
+                                     "Hesperiidae",
+                                     "Lycaenidae",
+                                     "Nymphalidae",
+                                     "Papilionidae",
+                                     "Pieridae",
+                                     "Riodinidae"
+))
+```
+
+Removed one species of order Trichoptera.
+
+```{r}
+b123_species_names <- bind_rows(b1_names_df, b2_names_df, b3_names_df) %>%
+  select(-naam_lat, -Wetenschappelijke.naam, -taxprio) %>%
+  distinct() %>%
+  left_join(rhopalocera, by = "family") %>%
+  mutate(clade = ifelse(is.na(clade) & order == "Lepidoptera", "Heterocera", clade)) %>%
+  filter(order == "Lepidoptera")
+
+rm(b1_names_df, b2_names_df, b3_names_df)
+```
+
+wrong species id | correct species id | species name
+-----------------|--------------------|---------------
+1946874 | 1946844 | Ochlodes venata
+4535447 | 6221746 | Speyeria aglaia
+5881450 | 4535827 | Aglais io
+4535434 | 7809779 | Fabriciana adippe
+
+
+Only the second number was used as species id; the records that had the first number were converted to the second number.
+
+```{r}
+extra_synonyms <- as.integer(c(1946874, 4535447, 5881450, 4535434))
+correct_names <- as.integer(c(1946844, 6221746, 4535827, 7809779))
+b123_species_names <- b123_species_names %>%
+  filter(!(species_id %in% extra_synonyms) ) 
+```
+
+
+```{r}
+b123 <- b123 %>%
+  mutate(species_id = case_when(
+    species_id == extra_synonyms[1] ~ correct_names[1],
+    species_id == extra_synonyms[2] ~ correct_names[2],
+    species_id == extra_synonyms[3] ~ correct_names[3],
+    species_id == extra_synonyms[4] ~ correct_names[4],
+    TRUE ~ species_id)
+    )
+```
+
+
+We exclude species that are much too rare for a SOM analysis (less than 200 records in total: this is very liberal; during the actual SOM analysis phase, much more species will likely be removed). A record is here a unique combination of km-square, year, month, day and datasource.
+
+```{r}
+b123 %>%  
+  count(species_id) %>%
+  filter(n < 200) %>%
+  left_join(b123_species_names %>%
+              distinct(species_id, species)) %>%
+  arrange(-n) %>%
+  kable(format = "latex",
+        longtable = TRUE) %>%
+  kableExtra::kable_styling(latex_options = "repeat_header")
+  
+```
+
+
+```{r}
+b123 <- b123 %>%
+  semi_join(b123_species_names, by = "species_id") %>%
+  anti_join(b123 %>%
+              count(species_id) %>%
+              filter(n < 200),
+            by = "species_id") 
+
+```
+
+
+```{r}
+b123 <- b123 %>%
+   group_by_at(.vars = vars(-count)) %>%
+  summarise(count = max(count)) %>%
+  ungroup()
+```
+
+
+```{r}
+b123_species_names <- b123_species_names %>%
+  distinct(species_id, species, clade) %>%
+  semi_join(b123 %>% distinct(species_id),
+            by = "species_id") 
+```
+
+
+
+## Determination of closure periods
+
+Separation between two flight periods is defined as a concavity in the density curve provided the distance from the concavity is at least 1/3 the maximum density value to the local peak left from the concavity and 1/5th to the local peak right from the concavity. In case of one generation, season_start is 5% percentile and season_end is 95% percentile. In case of more than one generation, the corresponding percentiles of the generation with most recordings is given.
+
+<!--
+DE CODE HIERONDER STAAT HET DEEL OM DE DATA TE FILTEREN VOLGENS CLOSURE PERIOD
+UITGECOMMENTARIEERD; AAN ARCO WERD DUS DE VOLLEDIGE DATA BEZORGD OMDAT hij gegevens nodig heeft over de gehele periode – ook buiten closure perioden – om nullen te genereren voor andere soorten.
+-->
+
+```{r}
+b123_closureperiods <- b123 %>%
+  group_by(species_id) %>%
+  nest() %>% 
+  mutate(seasondata = map(.x = data, .f = ~closure_periods(df = .x, 
+                                                           first = FALSE)),
+         plot = pmap(.l = list(data = data,
+                               seasondata = seasondata),
+                     .f = function(data, seasondata) {
+                       ggplot(data = data) +
+                         geom_density(aes(x = julian_day)) +
+                         geom_vline(data = seasondata %>%
+                                      gather(key = "key", value = "julian_day"),
+                                    aes(xintercept = julian_day, 
+                                        linetype = key == "valley")) +
+                         theme_bw() + 
+                         theme(legend.position = "none")
+                     })) %>%
+  unnest(seasondata) %>%
+  # mutate(data_filtered = pmap(.l = list(season_start = season_start,
+  #                                       season_end = season_end,
+  #                                       data = data),
+  #                             .f = function(data, season_start, season_end){
+  #                               data %>%
+  #                                 filter(between(julian_day, 
+  #                                                left = season_start, 
+  #                                                right = season_end))
+  #                             })) %>%
+  select(-data)
+```
+
+
+```{r}
+second_generation_species <- b123_closureperiods %>%
+  filter(max_generation == 2) %>%
+  select(species_id)
+```
+
+
+```{r eval = FALSE}
+plots <- b123_closureperiods %>%
+  inner_join(b123_species_names %>%
+               select(species_id, species)) %>%
+  mutate(filename = paste0(species, ".png")) %>% 
+  select(filename, plot)
+
+pwalk(plots, ggsave, path = "../output/")
+```
+
+
+
+## Total number of sightings by year and by site_id
+
+```{r}
+b123 %>%
+  count(year) %>%
+  ggplot() +
+  geom_line(aes(x = year, y = n)) +
+  scale_y_log10("Total number of sightings (log-scale!)")
+```
+
+
+```{r sfplot, cache = TRUE}
+be1grid %>%
+  rename(geometry = GEOMETRY) %>%
+  inner_join(b123 %>%
+              count(site_id),
+             by = c("cellcode" = "site_id")) %>%
+  ggplot() +
+  geom_sf(aes(fill = log(n)), lwd = 0) +
+  scale_fill_gradient(low = "azure", high = "azure4")
+```
+
+
+
+## Final tables
+
+
+Extra filter to keep only grid cells in grid_file_FINAL.
+
+```{r}
+grid_final <- read_excel(path = "../data/grid_file_FINAL.xlsx") %>%
+  rename(x_coord = `x-coord`, y_coord = `y-coord`)
+```
+
+
+```{r}
+butterflies <- b123 %>%
+  semi_join(b123_species_names %>%
+              filter(clade == "Rhopalocera"),
+            by = "species_id") %>%
+  rename(EEA_Gridcell = site_id) %>%
+  inner_join(grid_final %>%
+               select(site_id = Site_id, EEA_Gridcell),
+             by = "EEA_Gridcell") %>%
+  arrange(species_id, year, month, day) %>%
+  select(species_id, year, month, day, julian_day, site_id, source, count)
+
+
+```
+
+```{r eval=!file.exists(file.path("../output", "butterflies_observations_finalgrid.csv"))}
+butterflies %>%
+  readr::write_csv(path = file.path("../output", 
+                                  "butterflies_observations_finalgrid.csv"))
+```
+
+```{r eval=!file.exists(file.path("../output", "butterflies_observations_finalgrid_secondgeneration.csv"))}
+butterflies %>%
+  semi_join(second_generation_species) %>%
+  readr::write_csv(path = file.path("../output", 
+                                  "butterflies_observations_finalgrid_secondgeneration.csv"))
+```
+
+
+
+```{r}
+moths <- b123 %>%
+  semi_join(b123_species_names %>%
+              filter(clade == "Heterocera"),
+            by = "species_id") %>%
+  rename(EEA_Gridcell = site_id) %>%
+  inner_join(grid_final %>%
+               select(site_id = Site_id, EEA_Gridcell),
+             by = "EEA_Gridcell") %>%
+  arrange(species_id, year, month, day) %>%
+  select(species_id, year, month, day, julian_day, site_id, source, count) 
+```
+
+
+```{r eval=!file.exists(file.path("../output", "moths_observations_finalgrid.csv"))}
+moths %>%
+  readr::write_csv(path = file.path("../output", 
+                                  "moths_observations_finalgrid.csv"))
+```
+
+
+```{r eval=!file.exists(file.path("../output", "moths_observations_finalgrid_secondgeneration.csv"))}
+moths %>%
+  semi_join(second_generation_species) %>%
+  readr::write_csv(path = file.path("../output", 
+                                  "moths_observations_finalgrid_secondgeneration.csv"))
+```
+
+
+
+
+```{r warning=FALSE}
+safe_lookup_vernacular_names <- possibly(lookup_vernacular_names, 
+                                         otherwise = data.frame(species_name_NL = NA,
+                                                                species_name_FR = NA))
+b123_species_names <- b123_species_names %>%
+  group_by(species_id, species, clade) %>%
+  nest() %>%
+  mutate(vernacular = map(species_id, safe_lookup_vernacular_names)) %>%
+  unnest(vernacular) %>%
+  select(-data) %>%
+  rename(scientific_name = species) %>%
+  left_join(b123_closureperiods %>% 
+              select(species_id, season_start, season_end),
+            by = "species_id")
+```
+
+
+```{r eval=!file.exists(file.path("../output", "butterflies_species.csv"))}
+readr::write_csv(x = b123_species_names %>%
+                   filter(clade == "Rhopalocera") %>%
+                   arrange(scientific_name) %>%
+                   select(-clade),
+                 path = file.path("../output", "butterflies_species.csv"))
+```
+
+
+```{r eval=!file.exists(file.path("../output", "butterflies_species_secondgeneration.csv"))}
+readr::write_csv(x = b123_species_names %>%
+                   filter(clade == "Rhopalocera") %>%
+                   semi_join(second_generation_species) %>%
+                   arrange(scientific_name) %>%
+                   select(-clade),
+                 path = file.path("../output", "butterflies_species_secondgeneration.csv"))
+```
+
+```{r eval=!file.exists(file.path("../output", "moths_species.csv"))}
+readr::write_csv(x = b123_species_names %>%
+                   filter(clade == "Heterocera") %>%
+                   arrange(scientific_name) %>%
+                   select(-clade),
+                 path = file.path("../output", "moths_species.csv"))
+```
+
+```{r eval=!file.exists(file.path("../output", "moths_species_secondgeneration.csv"))}
+readr::write_csv(x = b123_species_names %>%
+                   filter(clade == "Heterocera") %>%
+                   semi_join(second_generation_species) %>%
+                   arrange(scientific_name) %>%
+                   select(-clade),
+                 path = file.path("../output", "moths_species_secondgeneration.csv"))
+```
+
+
+
+The following tables were written to csv files (comma separated, and . as decimal mark):
+
+`butterflies_observations_finalgrid.csv`, first ten rows:
+
+```{r}
+butterflies
+```
+
+`butterflies_observations_finalgrid_secondgeneration.csv`, first ten rows:
+
+```{r}
+butterflies %>%
+  semi_join(second_generation_species, by = "species_id")
+```
+
+
+`moths_observations_finalgrid.csv`, first ten rows:
+
+```{r}
+moths
+```
+
+`moths_observations_finalgrid_secondgeneration.csv`, first ten rows:
+
+```{r}
+moths %>%
+  semi_join(second_generation_species, by = "species_id")
+```
+
+
+`butterflies_species.csv`, first ten rows:
+
+```{r}
+b123_species_names %>%
+  filter(clade == "Rhopalocera") %>%
+  arrange(scientific_name) %>%
+  select(-clade)
+```
+
+`butterflies_species_secondgeneration.csv`, first ten rows:
+
+```{r}
+b123_species_names %>%
+  filter(clade == "Rhopalocera") %>%
+  semi_join(second_generation_species, by = "species_id") %>%
+  arrange(scientific_name) %>%
+  select(-clade)
+```
+
+
+`moths_species.csv`, first ten rows:
+
+```{r}
+b123_species_names %>%
+  filter(clade == "Heterocera") %>%
+  arrange(scientific_name) %>%
+  select(-clade)
+```
+
+
+
+`moths_species_secondgeneration.csv`, first ten rows:
+
+```{r}
+b123_species_names %>%
+  filter(clade == "Heterocera") %>%
+  semi_join(second_generation_species, by = "species_id") %>%
+  arrange(scientific_name) %>%
+  select(-clade)
+```
+
+
+
+
+
+```{r eval=FALSE}
+bspecies <- readr::read_csv(file = file.path("../output", "butterflies_species.csv"))
+bobs <- readr::read_csv(file = file.path("../output", 
+                                  "butterflies_observations_finalgrid.csv"))
+
+bspecies %>%
+  filter(species_id == 7809779) %>%
+  readr::write_csv(path = file.path("../output",
+                                    "fabriciana_adippe_species.csv"))
+
+bobs %>%
+  filter(species_id == 7809779) %>%
+  readr::write_csv(path = file.path("../output",
+                                    "fabriciana_adippe_observations_finalgrid.csv"))
+
+```
+
+
+
+
+
+
+
+
+
