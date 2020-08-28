@@ -44,7 +44,7 @@ The rendered versions of these files can be found in the `rendered` folder as ei
 
 # Processed data
 
-The processed data files can be obtained from the following Zenodo archive: [doi](doi).
+The processed data files can be obtained from [this Zenodo archive](10.5281/zenodo.4004609).
 
 
 
