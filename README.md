@@ -2,7 +2,7 @@
 
 This repository contains work done by the Research Institute for Nature and Forest (INBO) for WWF Belgium to prepare biodiversity data for the calculation of a regional Living Planet Index (LPI) for Belgium (LPR-BE).
 
-The publication of the Belgian LPI (REF NEEDED) can be consulted here (LINK NEEDED).
+The publication of the Belgian LPI can be consulted here [LINK NEEDED]().
 
 The analyses presented in the publication were part of a joint effort with multiple partners (Natuurpunt, Natagora, DEMNA, Arco Van Strien and INBO). 
 INBO was responsible for the preprocessing of the biodiversity data concerning grasshoppers, butterflies and moths.
