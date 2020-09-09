@@ -1,0 +1,39 @@
+{
+    "title": "Source code of data preprocessing steps for grasshoppers, butterflies and moths for use in WWF Living Planet Index calculations",
+    "description": "This archive provides the source code of of data preprocessing steps for grasshoppers, butterflies and moths for use in WWF Living Planet Index calculations. The preprocessing steps are written in R markdown (which contains both R code and explanatory text) and also available as rendered pdf or html technical reports.",
+    "license": "MIT",
+    "upload_type": "other",
+    "access_right": "open",
+    "creators": [
+        {
+            "name": "Van Calster, Hans",
+            "affiliation": "Research Institute for Nature and Forest",
+            "orcid": "0000-0001-8595-8426"
+        },
+        {
+            "name": "Lommelen, Els",
+            "affiliation": "Research Institute for Nature and Forest",
+            "orcid": "0000-0002-3481-5684"
+        }
+    ],
+    "keywords": [
+        "open science",
+        "research institute",
+        "Belgium",
+        "Living Planet Index Belgium",
+        "butterflies",
+        "moths",
+        "grasshoppers"
+        ],
+    "related_identifiers": [
+        {
+            'relation': 'isSupplementedBy',
+            'identifier':'10.5281/zenodo.4004608'
+        }
+    ],
+    "community": [
+        {
+            'identifier':'Research Institute for Nature and Forest (INBO)'
+        }
+    ]
+}
