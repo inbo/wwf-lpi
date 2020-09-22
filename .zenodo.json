@@ -27,13 +27,13 @@
         ],
     "related_identifiers": [
         {
-            'relation': 'isSupplementedBy',
-            'identifier':'10.5281/zenodo.4004608'
+            "relation": "isSupplementedBy",
+            "identifier": "10.5281/zenodo.4004608"
         }
     ],
     "community": [
         {
-            'identifier':'Research Institute for Nature and Forest (INBO)'
+            "identifier": "Research Institute for Nature and Forest (INBO)"
         }
     ]
 }
