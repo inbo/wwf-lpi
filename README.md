@@ -34,7 +34,7 @@ The contents in this repository is licensed under a MIT license.
 The `.Rproj` allows you to start this project as an [RStudio project](https://rstudio.com/), after cloning the remote GitHub repository to a local repository.
 
 The `media` folder contains density plots depicting the density of butterfly or moths sightings as a function of the day in the year.
-A vertical line in these plots indicate the demarcation between different flying periods.
+A vertical line in these plots indicates the demarcation between different flying periods.
 
 The `src` folder contains the R code used to pre-process the raw data.
 Note that the raw data are not released as open data, but the data obtained after pre-processing are released as open data [see Processed data](#processed-data). 
